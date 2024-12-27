@@ -1,0 +1,569 @@
+---
+title: "MALDI"
+format: html
+editor: visual
+---
+
+## Libraries
+
+```{r, echo=FALSE, warning=FALSE}
+# General data manipulation and visualization
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(openxlsx) # For exporting data to Excel
+
+# Libraries for mass spectrometry data handling
+library(MALDIquant)
+library(MALDIrppa)
+library(MALDIquantForeign) # To import .mzML files
+library(clusterSim) # For data normalization
+
+# Libraries for statistical analysis
+library(factoextra) # PCA and visualization
+library(FactoMineR)
+library(mixOmics)   # PLS-DA
+library(ropls)      # OPLS-DA
+library(caret)
+
+# Libraries for advanced visualization
+library(rgl)        # 3D visualization
+library(magick)     # Image manipulation
+library(rayshader)  # For 3D rendering
+library(av)         # For creating video exports
+
+```
+
+## Data input
+
+Raw mass spectra are loaded from the folder specified in the variable path, where all files in the .mzML format are imported into the R environment as XXX. The spectra are then renamed based on unique codes from the clinical dataset. For each patient sample, five technical replicates are differentiated using suffixes 1--5. Low-quality spectra are identified through a semi-automatic screening process that uses robust scale estimators of median intensities and derivative spectra:
+
+```{r, message = FALSE, warning=FALSE}
+path_HD = "C:\\Users\\user\\Documents\\R - ANALYSIS 2024\\Short communication - Liquid biopsy\\DATA\\HD"
+file.names_HD <- dir(path_HD, pattern =".mzml")
+HD <- importMzMl(file.path(path_HD, file.names_HD))
+
+path_MM = "C:\\Users\\user\\Documents\\R - ANALYSIS 2024\\Short communication - Liquid biopsy\\DATA\\MM"
+file.names_MM <- dir(path_MM, pattern =".mzml")
+MM <- importMzMl(file.path(path_MM, file.names_MM))
+
+
+HD_snam <- factor (c(rep("HD 1",5), rep("HD 2",5), rep("HD 3",5),
+                         rep("HD 4",5), rep("HD 5",5), rep("HD 6",5),
+                         rep("HD 7",5), rep("HD 8",5), rep("HD 9",5),
+                         rep("HD 10",5), rep("HD 11",5), rep("HD 12",5),
+                         rep("HD 13",5), rep("HD 14",5), rep("HD 15",5),
+                         rep("HD 16",5), rep("HD 17",5), rep("HD 18",5),
+                         rep("HD 19",5), rep("HD 20",5)))
+
+MM_snam <- factor(c(rep("MM 13",5), 
+                    rep("MM 14",5),
+                    rep("MM 15",5),
+                    rep("MM 16",5),
+                    rep("MM 1",5), rep("MM 17",5),
+                    rep("MM 2",5), rep("MM 18",5),
+                    rep("MM 3",5), rep("MM 19",5),
+                    rep("MM 4",5), rep("MM 20",5),
+                    rep("MM 5",5),
+                    rep("MM 6",5),
+                    rep("MM 7",5),
+                    rep("MM 8",5),
+                    rep("MM 9",5),
+                    rep("MM 10",5),
+                    rep("MM 11",5),
+                    rep("MM 12",5)))
+
+# TECHNICAL REAPLICATES 1-5
+HD_snam <- paste(HD_snam, 1:5)
+MM_snam <- paste(MM_snam, 1:5)
+
+# NEW NAMES FOR MASS SPECTRA
+names(HD) <- HD_snam
+names(MM) <- MM_snam
+
+# DATA TOGETHER
+DATA <- c(HD, MM)
+```
+
+### 
+
+## Mass spectra processing
+
+The raw mass spectra are processed following the MALDIquant workflow:
+
+a.  **Mass range trimming**: Spectra are trimmed to the specified mass range.
+b.  **Transformation**: Square root transformation is applied if required.
+c.  **Smoothing**: Intensities are smoothed using the Savitzky-Golay algorithm.
+d.  **Baseline correction**: The baseline is removed using the Sensitive Nonlinear Iterative Peak (SNIP) clipping algorithm.
+e.  **Normalization**: Intensities are calibrated using the median algorithm and normalized to a range of 0 to 1.
+
+```{r}
+SPECTRA_2 <- DATA
+SPECTRA_2 <- MALDIquant::trim(SPECTRA_2,c(2200,10000))
+# SPECTRA_2 <- transformIntensity(SPECTRA_2, method="sqrt")
+SPECTRA_2 <- smoothIntensity(SPECTRA_2, method = "SavitzkyGolay", halfWindowSize=100)
+SPECTRA_2 <- removeBaseline(SPECTRA_2, method="SNIP",iteration=500)
+names(SPECTRA_2) <- names(DATA)
+
+# NORMALISATION 0-1
+scale.max <- function(x){x/max(x)} # define scaling function
+SPECTRA_2 <- transfIntensity(SPECTRA_2, fun = scale.max)
+```
+
+### Mass spectra alignment
+
+Random oscillations in m/z positions across the measured dataset are corrected by warping the spectra. Reference signals are detected throughout the spectra, and their positions are adjusted using a computed nonlinear function. This process ensures the alignment of signal positions in the mass spectra.
+
+```{r}
+# PEAK DETECTION
+spectra <- SPECTRA_2
+peaks <- detectPeaks(spectra, method="MAD", halfWindowSize=20, SNR=15)
+  
+# WARPING FUNCTION
+par(mfrow=c(2, 2))
+warpingFunctions <- determineWarpingFunctions(peaks, tolerance=20,
+                                                plot=TRUE, plotInteractive=TRUE
+                                                ,minFrequency=0.2)
+  
+# WARP SPECTRA
+warpedSpectra <- warpMassSpectra(spectra, warpingFunctions)
+# WARP PEAKS
+warpedPeaks <- warpMassPeaks(peaks, warpingFunctions)
+  
+# COMPARE REGION OF MASS SPECTRA
+par(mfrow=c(2, 1))
+  
+plotSpectra <- function(unwarped, warped, range) {
+    plot(unwarped[[1]], main=paste0("unwarped spectra (mass ",
+                                    paste0(range, collapse=":"), " Da)"),
+         xlim=range, ylim=c(0, 0.4), type="n")
+    
+    color <- rainbow(length(unwarped))
+    
+    for (i in seq(along=unwarped)) {
+      lines(unwarped[[i]], col=color[i])
+    }
+    
+    plot(unwarped[[1]], main=paste0("warped spectra (mass ",
+                                    paste0(range, collapse=":"), " Da)"),
+         xlim=range, ylim=c(0, 0.4), type="n")
+    
+    for (i in seq(along=warped)) {
+      lines(warped[[i]], col=color[i])
+    }
+  }
+  
+  
+  windows()
+  par(mfrow=c(2, 1))
+  #plotSpectra(spectra, warpedSpectra, c(4700, 5200))
+  plotSpectra(spectra, warpedSpectra, c(6400, 6500))
+  par(mfrow=c(1, 1))
+
+spectra <- warpedSpectra
+```
+
+### Average mass spectra
+
+The average mass spectrum for each set of five technical replicates from an individual sample is calculated using a median algorithm
+
+```{r}
+SPECTRA_2 <-spectra
+avg_spectra <- tapply(SPECTRA_2, rep(seq_along(SPECTRA_2), each = 5, length.out = length(SPECTRA_2)),
+                      averageMassSpectra, method="med")
+
+DATA_snam_avg <- factor (c("HD 1", "HD 2", "HD 3",
+                     "HD 4", "HD 5", "HD 6",
+                     "HD 7", "HD 8", "HD 9",
+                     "HD 10", "HD 11", "HD 12",
+                     "HD 13", "HD 14", "HD 15",
+                     "HD 16", "HD 17", "HD 18",
+                     "HD 19", "HD 20",
+                     "MM 13", 
+                    "MM 14",
+                    "MM 15",
+                    "MM 16",
+                    "MM 1", "MM 17",
+                    "MM 2", "MM 18",
+                    "MM 3", "MM 19",
+                    "MM 4", "MM 20",
+                    "MM 5",
+                    "MM 6",
+                    "MM 7",
+                    "MM 8",
+                    "MM 9",
+                    "MM 10",
+                    "MM 11",
+                    "MM 12"))
+
+names(avg_spectra) <- DATA_snam_avg
+
+# SAVE AVERAGE MASS SPECTRA TO PDF
+pdf("AVG SPEKTRA.pdf") 
+spektra <- mapply(function(X,Y){plot(X, type="l",xlab="m/z",ylab="intensity (mV)", 
+                                     main=Y)}, avg_spectra, names(avg_spectra))
+dev.off()
+```
+
+### Peak detection
+
+Signals across the mass spectra are identified based on the signal-to-noise ratio (S/N) and a minimum frequency threshold across all spectra (default set to 15%). The detected signals are stored in a data matrix, prepared for subsequent multivariate statistical modeling. A classification variable is assigned to each sample.
+
+```{r}
+SNR=10
+peaks <- lapply(avg_spectra,function(X){detectPeaks(X,method="MAD",SNR=SNR, halfWindowSize=50)})
+summary(peaks)
+peaks <- binPeaks(peaks, tolerance=20)
+
+# SELECET ONLY PEAKS PRESENT > 10% ALL MASS SPECTRA
+1/length(peaks)
+peaksz <- filterPeaks(peaks, minFrequency=0.1, mergeWhitelists=TRUE)
+summary(peaksz)
+windows()
+peakPatterns(peaksz)
+
+# PEAK MATRIX
+IntMr <- intensityMatrix(peaksz, avg_spectra)
+IntMr <- as.data.frame(IntMr)
+colnames(IntMr) <- unlist(
+lapply(colnames(IntMr),function(x){return(as.character(round(as.numeric(x),0)))}))
+
+
+row.names(IntMr) <- names(avg_spectra)
+snam_2 <- names(avg_spectra)
+
+ss <- function(Xx){substr(Xx, start=1, stop=2)} 
+
+snam_2 <- ss(snam_2)
+snam_2
+IntMr$class <- as.factor(snam_2)
+
+
+a <- ncol(IntMr) 
+i<-IntMr[,-a] 
+j<-IntMr[,a] 
+IntMr <- IntMr[order(IntMr$class), ]
+
+# MATRIX EXPORT
+IntMr_exp <- IntMr
+write.xlsx(as.data.frame(IntMr_exp),file="DATA MATRIX.xlsx",asTable = FALSE,col.names=TRUE,row.names=TRUE)
+```
+
+## Descriptive statistics
+
+Box plots for each detected signal are generated to compare preselected biological classes. Statistical differences between these groups are analyzed and saved as a .pdf file.
+
+```{r}
+e <- ncol(IntMr)
+f <- e - 1 
+
+IntMr_SCALE <- IntMr
+my_comparisons <- list(c("HD", "MM"))
+
+BOX <- function(X){
+  ggplot(IntMr_SCALE, aes_(x = IntMr_SCALE$class, y=IntMr_SCALE[,X], fill = IntMr_SCALE[,e])) +
+    scale_fill_manual(values=c("blue","red", "green", "black")) +
+    #scale_fill_manual(values=c("red","orange", "blue", "cyan")) +
+    geom_point(color="black", size = 1.5) +
+    geom_boxplot(outlier.colour="red", outlier.shape=16, #notch=TRUE, 
+                 outlier.size=2, alpha = 0.80) +
+    #scale_x_discrete(guide = guide_axis(angle = 90)) +
+    #facet_grid(class ~ .) +
+    labs(title=X,x="Sample type", y = "Relative intensity (0-1)") +
+    guides(fill=FALSE) +
+    
+    #scale_y_continuous(limits=c(0,0.3), breaks=seq(0,0.3,0.05), expand = c(0, 0)) +
+    scale_x_discrete(guide = guide_axis(angle = 20)) + #n.dodge = 2 (odsazeni)
+    theme(axis.text = element_text(size=22)) +
+    #geom_point(color="black", size = 1.5) +
+    #geom_jitter(color="black", size=1.5, alpha=0.9) +
+    theme_bw(base_size = 20) +
+    #stat_compare_means(aes(group = class), label = "p.signif", size = 6) +
+    stat_compare_means(comparisons = my_comparisons)
+  # Add pairwise comparisons p-value
+  #stat_compare_means(aes(group = class),label = "p.signif")     # Add global p-value
+  # geom_dotplot(binaxis='y', stackdir='center', dotsize=1) +
+  # geom_jitter(shape=16, position=position_jitter(0.2))
+}
+
+pdf("BOX PLOTS.pdf") # AUTOMATICALLY SAVE TO PDF
+#windows()
+lapply(names(IntMr_SCALE[,1:f]), BOX)
+dev.off()
+```
+
+## Multivariate statistic
+
+Subgroups can be selected based on biological classes to simplify the dataset for initial analysis.
+
+```{r}
+IntMr_TEST <- IntMr %>%
+  subset(class == "HD" | class == "MM")
+
+IntMr_TEST$class <- as.vector(IntMr_TEST$class)
+IntMr_TEST$class <- as.factor(IntMr_TEST$class)
+```
+
+### Principal component analysis
+
+Principal Component Analysis (PCA), an unsupervised method, is applied to reduce the dimensionality of the dataset and identify the variables that contribute most to the variation in the original data. These variables are potential markers for distinguishing between biological classes. The data can be easily visualized in 2D or 3D space, providing insights into data distribution and demonstrating the grouping potential of the method.
+
+```{r}
+a <- ncol(IntMr_TEST)
+res.pca <- PCA(IntMr_TEST[,-a],  graph = FALSE)
+# EIGENVALUES
+Eigenvalues <-get_eig(res.pca)
+Eigenvalues <- as.data.frame(Eigenvalues)
+
+fviz_screeplot(res.pca, addlabels = TRUE, ylim = c(0, 40),
+               ggtheme = theme(
+                 axis.text = element_text(size = 10),
+                 axis.title = element_text(size = 16, face  = 'bold')))
+
+a <- ncol(IntMr_TEST)
+res.pca <- PCA(IntMr_TEST[,-a], graph = FALSE)
+res.pca <- PCA(IntMr_TEST[,-a], graph = FALSE)
+  
+# PLOT
+fviz_pca_ind(res.pca,
+             label = "none", # hide individual labels
+             habillage = IntMr_TEST$class, # color by groups
+             palette = c("blue","red","chartreuse4", "red", "brown","purple", "Navy", "yellow", "purple", "pink", "Magenta", "Cyan", "orange", "GREY"),
+             addEllipses = F, # Concentration ellipses
+             axes = c(1,2),
+             pointsize = 2,
+             legend = "top",
+             mean.point=F, # delete centroid
+             ggtheme = theme_minimal()
+               #axis.text = element_text(size = 10),
+               #axis.title = element_text(size = 16, face  = 'bold'))
+             #xlim = c(-10,10),
+             #ylim = c(-5,5)
+)
+# EXTRACT VARIABLES
+var <- get_pca_var(res.pca)
+var
+
+head(var$coord)
+
+head(var$contrib)
+PCA_contr <- as.data.frame(var$contrib)
+
+pdf("CONTRIBUTION TO PCA.pdf")
+# Contributions of variables to PC1
+fviz_contrib(res.pca, choice = "var", axes = 1, top = 20)
+# Contributions of variables to PC2
+fviz_contrib(res.pca, choice = "var", axes = 2, top = 20)
+# Contributions of variables to PC3
+fviz_contrib(res.pca, choice = "var", axes = 3, top = 10)
+dev.off() 
+
+# 3D PCA
+
+i<-IntMr_TEST[,-a]
+j<-IntMr_TEST[,a] 
+
+PCA_IntMr <- prcomp(i)
+color = c("blue","red","chartreuse4","brown","purple", "Navy", "yellow", "purple", "pink", "Magenta", "Cyan", "orange", "GREY")[j]
+color_2 = c("blue","red","chartreuse4","brown","purple", "Navy", "yellow", "purple", "pink", "Magenta", "Cyan", "orange", "GREY")
+
+
+# open 3d window
+open3d()
+# resize window
+par3d(windowRect = c(150, 150, 900, 900))
+plot3d(res.pca[["ind"]]$coord[,c(1:3)], col=color,
+       size = 2, type='s')
+legend3d("topright", legend = c("HD", "MM"), 
+         pch = 16,  col=color_2, cex=2, inset=c(0.02))
+play3d(spin3d( axis = c(0, 0, 1), rpm = 5), duration = 15)
+
+# save as .mp4
+render_movie("3D PCA.mp4",frames = 720, fps=30)
+```
+
+#### Export data in PCA coordinates
+
+The contribution of individual variables to the overall model, along with their coordinates in the new PCA dimensions, can be exported.
+
+```{r}
+PCA_EXP <- PCA_IntMr[["x"]]
+PCA_EXP <- PCA_EXP[,1:20] # NUMBER OF COMPONENT
+PCA_EXP <- as.data.frame(PCA_EXP)
+PCA_EXP$class <- IntMr_TEST$class
+rownames(PCA_EXP) <- rownames(IntMr_TEST)
+write.xlsx(PCA_EXP, file="PCA EXPORT.xlsx",asTable = FALSE,col.names=TRUE,row.names=TRUE)
+```
+
+### 
+
+Partial Least-Squares Discriminant Analysis (PLS-DA) and Orthogonal Partial Least Squares-Discriminant Analysis (OPLS-DA)
+
+Partial Least-Squares Discriminant Analysis (PLS-DA) and Orthogonal Partial Least Squares-Discriminant Analysis (OPLS-DA) are implemented as supervised versions of PCA. OPLS-DA can be used only for analysis twcomponentso biological classes in data. Method is optimized according to the performance for selected number of component. The optimal number of orthogonal components was evaluated based on the R2Y parameter (measure of goodness-of-fit of the model) and Q2Y value (model validity, i.e. how well the model predicts new data based on cross-validation).
+
+```{r}
+sacurine.plsda <- plsda(i, j)
+sacurine.oplsda <- opls(i, j,
+                        predI = 2, orthoI = 0)
+sacurine.oplsda <- opls(i, j,
+                        predI = 1, orthoI = 2)
+windows()
+plot(sacurine.oplsda,
+     typeVc = "x-score",
+     parEllipsesL = F,
+     parCexN = 0.8,
+     parLabVc = NA,
+     parPaletteVc = c("blue","red"))
+```
+
+## Machine learning
+
+### Data preparation
+
+When data are split into the train a test part, they are randomly divided 70:30%. The performance on train part or the whole dataset is evaluated using 5-folds 10x cross validation (CV).
+
+```{r}
+# DATA SPLIT INTO TRAIN/TEST DATASET
+AA <- IntMr_TEST
+split1<- sample(c(rep(0, 0.7 * nrow(AA)), rep(1, 0.3 * nrow(AA))))
+split1
+
+TRAIN <- AA[split1 == 0, ]   
+TEST <- AA[split1== 1, ] 
+
+# ALL DATA
+TRAIN <- IntMr_TEST
+
+set.seed(100)
+myfolds <- createMultiFolds(TRAIN$class, k = 5, times = 10)#, k = 5
+control <- trainControl("repeatedcv", index = myfolds, selectionFunction = "oneSE")
+```
+
+### Train models
+
+Five different machine learning (ML) predictive models can be trained: PLS-DA, k-NN, DT, RF, and ANN. Their performance is evaluated based on accuracy, sensitivity, and specificity using both the training and test datasets. Additionally, performance is assessed using CV on the entire dataset or the training cohort.
+
+```{r, echo=FALSE, warning=FALSE}
+# Train PLS model
+mod1 <- train(class ~ ., data = TRAIN,
+              method = "pls",
+              metric = "Accuracy",
+              tuneLength = 20,
+              trControl = control,
+              preProc = c("zv","center","scale"))
+plot(mod1, main = "PLS")
+
+# K-nearest neighbors
+mod2 <- train(class ~ ., data = TRAIN,
+              method = "knn", #multinom
+              metric = "Accuracy",
+              tuneLength = 20,
+              trControl = control,
+              preProc = c("zv","center","scale","pca"))
+plot(mod2, main = "KNN")
+
+# RF
+mod3 <- train(class ~ ., data = TRAIN,
+              method = "rf",
+              metric = "Accuracy",
+              trControl = control,
+              tuneLength = 20,
+              preProc = c("zv","center","scale"))
+plot(mod3, main = "RF")
+
+# DT
+mod4 <- train(class ~ ., data = TRAIN,
+              method = "ctree", #rpart
+              metric = "Accuracy",
+              trControl = control,
+              tuneLength = 20,
+              preProc = c("zv","center","scale"))
+# Check CV profile
+plot(mod4, main = "DT")
+
+# ANN
+
+
+mod5 <- train(class ~ ., data = TRAIN,
+              method = "nnet",
+              trControl = control)
+
+importance <- varImp(mod1, scale=T)
+plot(importance, top=10)
+```
+
+### Prediction performance
+
+The predictions for each model can be easily exported for the entire dataset or can be displayed in a way that illustrates how each model classifies individual samples.
+
+```{r}
+models <- resamples(list("PLS-DA" = mod1, "K-n" = mod2, "RF" = mod3, "DT" = mod4, "ANN" = mod5))
+
+summary(models, metric = "Accuracy")
+models$models <- factor(models$models, levels=c('PLS-DA', 'K-n', 'RF', 
+                                                'DT', 'ANN'))
+
+windows()
+bwplot(models, metric = "Accuracy", xlim = c(-0.1,1.1),
+       col=c("black","black","black","black","red"),
+       par.settings=list(box.rectangle=list(col=c("black","black","black","black","red")),
+                         box.umbrella=list(col=c("black","black","black","black","red")),
+                         plot.symbol=list(col="black",alpha=0.6)))
+
+# EXTRACT ACCURACY
+accuracy_results <- models$values[, grepl("Accuracy", names(models$values))]
+# CONFIDENCE INTERVALS
+conf_intervals <- data.frame(
+  Model = colnames(accuracy_results),
+  Mean = colMeans(accuracy_results, na.rm = TRUE),
+  Lower95 = apply(accuracy_results, 2, function(x) mean(x, na.rm = TRUE) - 1.96 * sd(x, na.rm = TRUE) / sqrt(length(na.omit(x)))),
+  Upper95 = apply(accuracy_results, 2, function(x) mean(x, na.rm = TRUE) + 1.96 * sd(x, na.rm = TRUE) / sqrt(length(na.omit(x)))))
+print(conf_intervals)
+
+write.xlsx(as.data.frame(conf_intervals),file="ML CONFIDENCE INTERVALS.xlsx",asTable = FALSE,col.names=TRUE,row.names=TRUE)
+
+
+# PREDICT TRAIN
+predicted <-
+  list(
+    pls = predict(mod1, TRAIN[,-a]),
+    knn = predict(mod2, TRAIN[,-a]),
+    rf = predict(mod3, TRAIN[,-a]),
+    rpart = predict(mod4, TRAIN[,-a]),
+    ann = predict(mod5, TRAIN[,-a])
+  )
+
+cm <- lapply(predicted,confusionMatrix,reference=TRAIN$class) #,positive="Good"
+acc <- lapply(cm,function(x){
+  o <- x$overall[1:2]
+  b <- x$byClass[5:7]
+  df <- c(o,b)
+})
+df <- round(do.call(rbind,acc),3)
+df
+cm
+
+results <- as.data.frame(cm$pls$table)
+
+
+
+# PREDICT TEST
+predicted <-
+  list(
+    pls = predict(mod1, TEST[,-a]),
+    knn = predict(mod2, TEST[,-a]),
+    rf = predict(mod3, TEST[,-a]),
+    rpart = predict(mod4, TEST[,-a]),
+    ann = predict(mod5, TEST[,-a])
+  )
+
+cm2 <- lapply(predicted,confusionMatrix,reference=TEST$class)
+acc2 <- lapply(cm2,function(x){
+  o2 <- x$overall[1:2]
+  b2 <- x$byClass[5:7]
+  df2 <- c(o2,b2)
+})
+df2 <- round(do.call(rbind,acc2),3)
+df2
+cm2
+```
